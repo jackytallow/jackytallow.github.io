@@ -1,9 +1,9 @@
 ---
 layout:     post
 title:      "考研心情 "
-subtitle:   "examination`s mood "
-date:       2018-03-26 02:00:00
-author:     "Hector.Z"
+subtitle:   "examinations mood "
+date:       2019-03-26 02:00:00
+author:     "Jacky Tallow"
 header-img: "img/post-think-try-write.jpg"
 tags:
     - 聊聊
