@@ -55,7 +55,7 @@ duoshuo_share: false                     # set to false if you want to use Comme
 
 # Sidebar settings
 sidebar: true                           # whether or not using Sidebar.
-sidebar-about-description: "一定会更疯狂。"
+sidebar-about-description: "追逐更高更远的脚步"
 sidebar-avatar: /img/jacky.jpg      # use absolute URL, seeing it's used in both `/` and `/about/`
 
 
