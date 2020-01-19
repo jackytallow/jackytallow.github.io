@@ -1,25 +1,84 @@
 ---
 layout:     post
-title:      "Okhttp初步解析（菜鸟级）"
+title:      "Okhttp源码初步解析（菜鸟级）"
 subtitle:   "Spring and morning"
 date:       2020-01-19 10:41:00
 author:     "Jacky Tallow"
-header-img: "img/Okhttp.jpg"
+header-img: "img/okhttp-icon.jpg"
 tags:
     - 聊聊
 ---
 
+开发一个应用如果没有网络编程的话，我觉得是没有灵魂的，而OkHttp作为目前最广泛应用的网络框架，有必要对它的源码进行解析，收获良多
 
-眼下正是这个冬天最冷的时候，在宿舍也不禁瑟瑟发抖。
+一.整体的思路
+首先我GitHub上下载了Okhttp源码，从使用方法上进行出发，了解到内部怎么使用，有什么样的实现方法和技巧，或者用了什么范式。对于这些技术和范式，目前只是初步分析，功力还不够深厚，有什么见解还是需要进一步和大神们探讨
+ps:目前下载GitHub上的Okhttp源码都是用Kotlin写的，所以我找了之前Android原生的，这样也方便自己理解
 
-今天，最后一科考完了，又一个学期结束了。
+二.基本用例
+通过查看官网，对照着源码，使用基本用例
+## 2.1.创建OkHttpClient对象
+```
+OkhttpClient client = OkhttpClickent();
+```
+这里的话我有个疑问，为什么没有builder呢，原来在它的构造函数中进行了
+```
+public OkHttpClient() {
+  this(new Builder());
+}
+```
+这里应该是官方方便我们使用，提出了一个快捷操作，在OkhttpClickent.builder中有很多类成员
+可以看一下，目前还不是很了解,之后再分析
+```
+public Builder() {
+  dispatcher = new Dispatcher();
+  protocols = DEFAULT_PROTOCOLS;
+  connectionSpecs = DEFAULT_CONNECTION_SPECS;
+  proxySelector = ProxySelector.getDefault();
+  cookieJar = CookieJar.NO_COOKIES;
+  socketFactory = SocketFactory.getDefault();
+  hostnameVerifier = OkHostnameVerifier.INSTANCE;
+  certificatePinner = CertificatePinner.DEFAULT;
+  proxyAuthenticator = Authenticator.NONE;
+  authenticator = Authenticator.NONE;
+  connectionPool = new ConnectionPool();
+  dns = Dns.SYSTEM;
+  followSslRedirects = true;
+  followRedirects = true;
+  retryOnConnectionFailure = true;
+  connectTimeout = 10_000;
+  readTimeout = 10_000;
+  writeTimeout = 10_000;
+}
+```
 
-我又可以在寒假做我喜欢的事，看书，弹琴，骑行，当然最重要的还是学习技术。
+## 2.2.下面开始发起Http请求
+话不多说，先看下源码
+```
+String run(String url) throws IOException {
+  Request request = new Request.Builder()
+      .url(url)
+      .build();
 
-但我的思绪是混乱的，如何规划整个假期，是一个非常头疼的事情。
+  Response response = client.newCall(request).execute();
+  return response.body().string();
+}
+```
 
-常言道，一年之计在于春，一日之计在于晨。
+OkhttpClicent实现了Call.Factory,负责创建新的Call
+可以看下它是如何创建Call的
+```
+/**
+  * Prepares the {@code request} to be executed at some point in the future.
+  */
+@Override public Call newCall(Request request) {
+  return new RealCall(this, request);
+}
+```
+这样以来，可算明白了，功劳全在RealCall这个类身上了，下面我一边分析同步网络请求的过程，一边了解RealCall的具体内容
 
-换言之，就是要规划好自己的时间安排，养成早睡早起的习惯。
+### 2.2.1.同步网络请求
+我首先看了RealCall#execute
 
-现在就是一个非常好的开端嘛。
+
+### 2.2.2发起异步网络请求
