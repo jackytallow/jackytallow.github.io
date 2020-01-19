@@ -1,7 +1,7 @@
 ---
 layout:     post
 title:      "Okhttp源码初步解析（菜鸟级）"
-subtitle:   "Spring and morning"
+subtitle:   "OkHTTP contrbution"
 date:       2020-01-19 10:41:00
 author:     "Jacky Tallow"
 header-img: "img/okhttp-icon.jpg"
@@ -79,6 +79,230 @@ OkhttpClicent实现了Call.Factory,负责创建新的Call
 
 ### 2.2.1.同步网络请求
 我首先看了RealCall#execute
+```
+@Override public Response execute() throws IOException {
+  synchronized (this) {
+    if (executed) throw new IllegalStateException("Already Executed");  // (1)
+    executed = true;
+  }
+  try {
+    client.dispatcher().executed(this);                                 // (2)
+    Response result = getResponseWithInterceptorChain();                // (3)
+    if (result == null) throw new IOException("Canceled");
+    return result;
+  } finally {
+    client.dispatcher().finished(this);                                 // (4)
+  }
+}
+```
+这里呢做了四件事，大概理解了下
+1. 检查这个call是否被执行了，如果没有就抛出异常，并且每个call只能被执行一次，如果想要一个完全一样的call的话，可以利用call#clone的方法进行
+2. 利用clone.dispatcher().excute(this)来进行实际执行dispatcher是刚才看到的OkhttpClient.Builder的成员之一，为此查看了文档，这个是自己异步Http请求的执行策略，现在看来，感觉同步请求它也有参与
+3. 调用getResponseWithInterceptorChain()这个函数获取Http返回结果，从函数名可以看出，这个还会进行一系列“拦截”操作
+4. 最后还要通知dispatcher自己已经执行完毕了
 
+关于dispatcher这里我们不过度关注，在同步执行的流程中,涉及到dispatcher只不过是告知它们这些运行状态，比如开始执行execute，比如执行完毕了finished，
+所以我们在异步请求的时候会执行相应的操作
+
+其实发出网络请求，解析返回结果的，还是getResponseWithInterceptorChain()
+```
+private Response getResponseWithInterceptorChain() throws IOException {
+  // Build a full stack of interceptors.
+  List<Interceptor> interceptors = new ArrayList<>();
+  interceptors.addAll(client.interceptors());
+  interceptors.add(retryAndFollowUpInterceptor);
+  interceptors.add(new BridgeInterceptor(client.cookieJar()));
+  interceptors.add(new CacheInterceptor(client.internalCache()));
+  interceptors.add(new ConnectInterceptor(client));
+  if (!retryAndFollowUpInterceptor.isForWebSocket()) {
+    interceptors.addAll(client.networkInterceptors());
+  }
+  interceptors.add(new CallServerInterceptor(
+      retryAndFollowUpInterceptor.isForWebSocket()));
+
+  Interceptor.Chain chain = new RealInterceptorChain(
+      interceptors, null, null, null, 0, originalRequest);
+  return chain.proceed(originalRequest);
+}
+```
+
+我曾经在Okhttp开发者之一的介绍Okhttp的文章里面，作者有讲到
+```
+the whole thing is just a stack of built-in interceptor
+```
+
+可以见Interceptor是Okhttp最核心的一个东西，不要误以为它只是拦截请求进行一些额外的处理，实际上把实际网络请求，缓存，透明压缩等功能都统一了起来
+每个功能都只是一个Interceptor，他们在连接在一个Interceptor.Chain,环环相扣
+在配置OkHttpClient时设置的interceptors；
+1. 负责失败重试以及重定向的RetryAndFollowUpInterceptor；
+2. 负责把用户构造的请求转换为发送到服务器的请求、把服务器返回的响应转换为用户友好的响应的BridgeInterceptor；
+3. 负责读取缓存直接返回、更新缓存的CacheInterceptor；
+4. 负责和服务器建立连接的ConnectInterceptor；
+5. 配置OkHttpClient时设置的networkInterceptors；
+6. 负责向服务器发送请求数据、从服务器读取响应数据CallServerInterceptor。
+
+在这里，位置决定了功能，最后一个 Interceptor 一定是负责和服务器实际通讯的，重定向、缓存等一定是在实际通讯之前的。
+责任链模式在这个Interceptor链条中得到了很好的实践。
+```
+它包含了一些命令对象和一系列的处理对象，每一个处理对象决定它能处理哪些命令对象，它也知道如何将它不能处理的命令对象传递给该链中的下一个处理对象。该模式还描述了往该处理链的末尾添加新的处理对象的方法。
+```
+对于把Request变成Response这件事来说，每个Interceptor都可能完成这件事，所以我们循着链条让每个Interceptor自行决定能否完成任务以及怎么完成任务（自力更生或者交给下一个Interceptor）。这样一来，完成网络请求这件事就彻底从RealCall类中剥离了出来，简化了各自的责任和逻辑。两个字：优雅！
+责任链模式在安卓系统中也有比较典型的实践，例如 view 系统对点击事件（TouchEvent）的处理。
+回到 OkHttp，在这里我先简单分析一下ConnectInterceptor和CallServerInterceptor，看看 OkHttp 是怎么进行和服务器的实际通信的。
+
+#### 2.2.1.1建立连接：ConnectInterceptor
+```
+@Override public Response intercept(Chain chain) throws IOException {
+  RealInterceptorChain realChain = (RealInterceptorChain) chain;
+  Request request = realChain.request();
+  StreamAllocation streamAllocation = realChain.streamAllocation();
+
+  // We need the network to satisfy this request. Possibly for validating a conditional GET.
+  boolean doExtensiveHealthChecks = !request.method().equals("GET");
+  HttpCodec httpCodec = streamAllocation.newStream(client, doExtensiveHealthChecks);
+  RealConnection connection = streamAllocation.connection();
+
+  return realChain.proceed(request, streamAllocation, httpCodec, connection);
+}
+```
+实际上建立连接就是创建一个HttpCodec对象，这是什么呢？通过理解，这是对htttp通讯协议抽象的过程，
+有两个实现分别是http1Codec和http2Codec，对应的就是Http1.1请求和Http2请求
+
+在Http1Codec中，它利用Okio对Socket的读写操作进行封装，Okio 以后有机会再进行分析，现在让我们对它们保持一个简单地认识：它对java.io和java.nio进行了封装，让我们更便捷高效的进行 IO 操作。
+
+而创建HttpCodec对象的过程涉及到StreamAllocation、RealConnection，代码较长，这里就不展开，这个过程概括来说，就是找到一个可用的RealConnection，再利用RealConnection的输入输出（BufferedSource和BufferedSink）创建HttpCodec对象，供后续步骤使用。
+
+#### 2.2.1.2发送和接收数据： CallServerInterceptor
+```
+@Override public Response intercept(Chain chain) throws IOException {
+  HttpCodec httpCodec = ((RealInterceptorChain) chain).httpStream();
+  StreamAllocation streamAllocation = ((RealInterceptorChain) chain).streamAllocation();
+  Request request = chain.request();
+
+  long sentRequestMillis = System.currentTimeMillis();
+  httpCodec.writeRequestHeaders(request);
+
+  if (HttpMethod.permitsRequestBody(request.method()) && request.body() != null) {
+    Sink requestBodyOut = httpCodec.createRequestBody(request, request.body().contentLength());
+    BufferedSink bufferedRequestBody = Okio.buffer(requestBodyOut);
+    request.body().writeTo(bufferedRequestBody);
+    bufferedRequestBody.close();
+  }
+
+  httpCodec.finishRequest();
+
+  Response response = httpCodec.readResponseHeaders()
+      .request(request)
+      .handshake(streamAllocation.connection().handshake())
+      .sentRequestAtMillis(sentRequestMillis)
+      .receivedResponseAtMillis(System.currentTimeMillis())
+      .build();
+
+  if (!forWebSocket || response.code() != 101) {
+    response = response.newBuilder()
+        .body(httpCodec.openResponseBody(response))
+        .build();
+  }
+
+  if ("close".equalsIgnoreCase(response.request().header("Connection"))
+      || "close".equalsIgnoreCase(response.header("Connection"))) {
+    streamAllocation.noNewStreams();
+  }
+
+  // 省略部分检查代码
+
+  return response;
+}
+```
+
+我们抓住主干部分
+1. 向服务器发送request header（请求头）
+2. 如果有request body，就向服务器发送
+3. 读取response header，先构造一个Response对象
+4. 如果有response body，就在3的基础上加上body构造一个新的Response对象
+
+这里我们可以看到，核心工作都由HttpCodec对象完成，而HttpCodec实际上利用的是 Okio，而 Okio 实际上还是用的Socket，所以没什么神秘的，只不过一层套一层，层数有点多。
+
+其实Interceptor的设计也是一种分层的思想，每个Interceptor就是一层。为什么要套这么多层呢？分层的思想在 TCP/IP 协议中就体现得淋漓尽致，分层简化了每一层的逻辑，每层只需要关注自己的责任（单一原则思想也在此体现），而各层之间通过约定的接口/协议进行合作（面向接口编程思想），共同完成复杂的任务。
+
+简单应该是我们的终极追求之一，尽管有时为了达成目标不得不复杂，但如果有另一种更简单的方式，我想应该没有人不愿意替换。
 
 ### 2.2.2发起异步网络请求
+```
+client.newCall(request).enqueue(new Callback() {
+    @Override
+    public void onFailure(Call call, IOException e) {
+    }
+
+    @Override
+    public void onResponse(Call call, Response response) throws IOException {
+        System.out.println(response.body().string());
+    }
+});
+
+// RealCall#enqueue
+@Override public void enqueue(Callback responseCallback) {
+  synchronized (this) {
+    if (executed) throw new IllegalStateException("Already Executed");
+    executed = true;
+  }
+  client.dispatcher().enqueue(new AsyncCall(responseCallback));
+}
+
+// Dispatcher#enqueue
+synchronized void enqueue(AsyncCall call) {
+  if (runningAsyncCalls.size() < maxRequests && runningCallsForHost(call) < maxRequestsPerHost) {
+    runningAsyncCalls.add(call);
+    executorService().execute(call);
+  } else {
+    readyAsyncCalls.add(call);
+  }
+```
+这里我们就能看到 dispatcher 在异步执行时发挥的作用了，如果当前还能执行一个并发请求，那就立即执行，否则加入readyAsyncCalls队列，而正在执行的请求执行完毕之后，会调用promoteCalls()函数，来把readyAsyncCalls队列中的AsyncCall“提升”为runningAsyncCalls，并开始执行。
+
+这里的AsyncCall是RealCall的一个内部类，它实现了Runnable，所以可以被提交到ExecutorService上执行，而它在执行时会调用getResponseWithInterceptorChain()函数，并把结果通过responseCallback传递给上层使用者。
+
+这样看来，同步请求和异步请求的原理是一样的，都是在getResponseWithInterceptorChain()函数中通过Interceptor链条来实现的网络请求逻辑，而异步则是通过ExecutorService实现。
+
+## 2.3返回数据的获取
+
+在上述同步（Call#excute()执行之后）或者异步（Callback#onResponse()回调中）请求完成之后
+我们就可以从Response对象中拿取数据了，包括 HTTP status code，status message，response header，response body 等。这里 body 部分最为特殊，因为服务器返回的数据可能非常大，所以必须通过数据流的方式来进行访问（当然也提供了诸如string()和bytes()这样的方法将流内的数据一次性读取完毕），而响应中其他部分则可以随意获取。
+
+响应body被封装到ReponseBody类中，该类主要有两点主要注意
+1. 每个body只能被消费一次，多次消费会抛出异常
+2. body必须关闭，否则发生资源泄露
+
+在2.2.1.2发送和接收数据：CallServerInterceptor小节中，我们就看过了body相关的代码
+```
+if (!forWebSocket || response.code() != 101) {
+  response = response.newBuilder()
+      .body(httpCodec.openResponseBody(response))
+      .build();
+}
+```
+由HttpCode#openResponseBody提供具体HTTP协议版本的响应body，而HttpCodec则是利用Okio实现具体的数据
+IO操作
+
+这里有一点值得一提，OkHttp 对响应的校验非常严格，HTTP status line 不能有任何杂乱的数据，否则就会抛出异常，在我们公司项目的实践中，由于服务器的问题，偶尔 status line 会有额外数据，而服务端的问题也毫无头绪，导致我们不得不忍痛继续使用 HttpUrlConnection，而后者在一些系统上又存在各种其他的问题，例如魅族系统发送 multi-part form 的时候就会出现没有响应的问题（我就是魅族Pro7所以出现了这样的问题）
+
+## 2.4HTTP缓存
+
+在2.2.1.同步网络请求小节中，我们已经看到了Interceptor的布局，在建立连接、和服务器通讯之前，就是CacheInterceptor，在建立连接之前，我们检查响应是否已经被缓存、缓存是否可用，如果是则直接返回缓存的数据，否则就进行后面的流程，并在返回之前，把网络的数据写入缓存。
+
+这块代码比较多，但也很直观，主要涉及 HTTP 协议缓存细节的实现，而具体的缓存逻辑 OkHttp 内置封装了一个Cache类，它利用DiskLruCache，用磁盘上的有限大小空间进行缓存，按照 LRU 算法进行缓存淘汰，这里也不再展开。
+
+我们可以在构造OkHttpClient时设置Cache对象，在其构造函数中我们可以指定目录和缓存大小：
+```
+public Cache(File directory, long maxSize);
+```
+如果我们对OkHttp内置的Cache不满意的话，可以自行实现IternalCache接口，在构造OkhttpClient时进行设置，这样就可以使用我们自定义的缓存策略了
+
+
+三.总结
+
+Okhttp还有很多细节部分没有在本文展开，例如HTTP2/HTTPS的支持，但建立一个清晰的概览挺重要的
+
+1. OkHttpClient实现Call.Factory，负责为Request创建Call；
+2. RealCall为具体的Call实现，其enqueue()异步接口通过Dispatcher利用ExecutorService实现，而最终进行网络请求时和同步execute()接口一致，都是通过getResponseWithInterceptorChain()函数实现；
+3. getResponseWithInterceptorChain()中利用Interceptor链条，分层实现缓存、透明压缩、网络 IO 等功能；
