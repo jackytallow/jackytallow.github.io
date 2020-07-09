@@ -1,0 +1,115 @@
+---
+layout:     post
+title:      "AndroidP绕过反射非公开API的方法"
+subtitle:   "Talk About Service"
+date:       2020-07-02 19:48:00
+author:     "Jacky Tallow"
+header-img: "img/service-icon.jpg"
+tags:
+    - 聊聊
+---
+
+## 简介
+- 2018年发布的 Android P上引入了针对非公开API的限制，对开发者来说，这绝对是有史以来最重大的变化之一。前天 Google 发布了 Android Q 的 Beta 版，越来越多的 API 被加入了黑名单，而且 Google 要求下半年 APP 必须 target 28，这意味着现在的深灰名单也会生效；可以预见，在不久的将来，我们要跟大量的 API 说再见了。
+
+## 一种绕过Android对非SDK限制的简单方法
+- NDK中私有库的链接的调整
+- VirtualXPosed在Android P上无法运行，可以看下系统如何实现这个限制，如是说通过反射或者JNI访问非公开接口时候会触发警告/异常等，java.lang.Class.getDeclaredMethod(String) 看起，这个方法在Java层最终调用到了 getDeclaredMethodInternal 这个native方法
+```
+static jobject Class_getDeclaredMethodInternal(JNIEnv* env, jobject javaThis,
+                                               jstring name, jobjectArray args) {
+  ScopedFastNativeObjectAccess soa(env);
+  StackHandleScope<1> hs(soa.Self());
+  DCHECK_EQ(Runtime::Current()->GetClassLinker()->GetImagePointerSize(), kRuntimePointerSize);
+  DCHECK(!Runtime::Current()->IsActiveTransaction());
+  Handle<mirror::Method> result = hs.NewHandle(
+      mirror::Class::GetDeclaredMethodInternal<kRuntimePointerSize, false>(
+          soa.Self(),
+          DecodeClass(soa, javaThis),
+          soa.Decode<mirror::String>(name),
+          soa.Decode<mirror::ObjectArray<mirror::Class>>(args)));
+  if (result == nullptr || ShouldBlockAccessToMember(result->GetArtMethod(), soa.Self())) {
+    return nullptr;
+  }
+  return soa.AddLocalReference<jobject>(result.Get());
+}
+```
+- 注意那个 ShouldBlockAccessToMember 调用了吗？如果它返回false，那么直接返回nullptr，上层就会抛 NoSuchMethodXXX 异常；也就触发系统的限制了
+```
+ALWAYS_INLINE static bool ShouldBlockAccessToMember(T* member, Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  hiddenapi::Action action = hiddenapi::GetMemberAction(
+      member, self, IsCallerTrusted, hiddenapi::kReflection);
+  if (action != hiddenapi::kAllow) {
+    hiddenapi::NotifyHiddenApiListener(member);
+  }
+  return action == hiddenapi::kDeny;
+}
+```
+- 注意返回false的时候，直接返回nullptr，抛出NoSuch
+```
+ALWAYS_INLINE static bool ShouldBlockAccessToMember(T* member, Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  hiddenapi::Action action = hiddenapi::GetMemberAction(
+      member, self, IsCallerTrusted, hiddenapi::kReflection);
+  if (action != hiddenapi::kAllow) {
+    hiddenapi::NotifyHiddenApiListener(member);
+  }
+  return action == hiddenapi::kDeny;
+}
+```
+- 接着继续看hidden_api.cc中的GetMemberAction的方法
+```
+template<typename T>
+inline Action GetMemberAction(T* member,
+                              Thread* self,
+                              std::function<bool(Thread*)> fn_caller_is_trusted,
+                              AccessMethod access_method)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  DCHECK(member != nullptr);
+  // Decode hidden API access flags.
+  // NB Multiple threads might try to access (and overwrite) these simultaneously,
+  // causing a race. We only do that if access has not been denied, so the race
+  // cannot change Java semantics. We should, however, decode the access flags
+  // once and use it throughout this function, otherwise we may get inconsistent
+  // results, e.g. print whitelist warnings (b/78327881).
+  HiddenApiAccessFlags::ApiList api_list = member->GetHiddenApiAccessFlags();
+  Action action = GetActionFromAccessFlags(member->GetHiddenApiAccessFlags());
+  if (action == kAllow) {
+    // Nothing to do.
+    return action;
+  }
+  // Member is hidden. Invoke `fn_caller_in_platform` and find the origin of the access.
+  // This can be *very* expensive. Save it for last.
+  if (fn_caller_is_trusted(self)) {
+    // Caller is trusted. Exit.
+    return kAllow;
+  }
+  // Member is hidden and caller is not in the platform.
+  return detail::GetMemberActionImpl(member, api_list, action, access_method);
+}
+```
+
+- 接着使用HanlderCurrentActivity中的方法
+```
+Method metaGetDeclaredMethod =
+        Class.class.getDeclaredMethod("getDeclardMethod"); // 公开API，无问题
+Method hiddenMethod = metaGetDeclaredMethod.invoke(hiddenClass,
+        "hiddenMethod", "hiddenMethod参数列表"); // 系统类通过反射使用隐藏 API，检查直接通过。
+hiddenMethod.invoke // 正确找到 Method 直接反射调用
+```
+
+- 可以通过元反射去进行编译Feild方法
+```
+if (shouldWarn || action == kDeny) {
+    if (member_signature.IsExempted(runtime->GetHiddenApiExemptions())) {
+      action = kAllow;
+      // Avoid re-examining the exemption list next time.
+      // Note this results in no warning for the member, which seems like what one would expect.
+      // Exemptions effectively adds new members to the whitelist.
+      MaybeWhitelistMember(runtime, member);
+      return kAllow;
+    }
+    // 略    
+}
+```
